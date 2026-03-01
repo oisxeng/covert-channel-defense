@@ -1,79 +1,121 @@
 import math
 import random
+import argparse
 from collections import Counter
-# Hinweis für Nutzer: pip install nltk
 import nltk
 from nltk.corpus import wordnet
+from nltk.tokenize import word_tokenize
+from nltk.tag import pos_tag
 
-# NLTK Ressourcen herunterladen (beim ersten Start)
-try:
-    nltk.data.find('corpora/wordnet')
-except LookupError:
-    nltk.download('wordnet')
-    nltk.download('averaged_perceptron_tagger')
+# Lade NLTK Ressourcen sicher herunter
+def setup_nltk():
+    resources = ['punkt', 'wordnet', 'averaged_perceptron_tagger']
+    for res in resources:
+        try:
+            nltk.data.find(f'tokenizers/{res}' if res == 'punkt' else f'corpora/{res}')
+        except LookupError:
+            nltk.download(res, quiet=True)
 
-def calculate_shannon_entropy(text):
+setup_nltk()
+
+def get_wordnet_pos(treebank_tag):
     """
-    Berechnet die Shannon-Entropie eines Textes auf Zeichenebene.
-    (Repräsentiert die 'Entropy Analysis' aus Abschnitt 4 des Papers).
-    Eine ungewöhnlich hohe Entropie in scheinbar banalem Text ('Slop') 
-    kann auf versteckte steganographische Payloads hinweisen.
+    Übersetzt die NLTK POS-Tags in WordNet POS-Tags.
+    Das sorgt dafür, dass Verben nur durch Verben und Nomen nur durch Nomen ersetzt werden.
+    """
+    if treebank_tag.startswith('J'):
+        return wordnet.ADJ
+    elif treebank_tag.startswith('V'):
+        return wordnet.VERB
+    elif treebank_tag.startswith('N'):
+        return wordnet.NOUN
+    elif treebank_tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return None
+
+def calculate_entropy(text, level='word'):
+    """
+    Berechnet die Shannon-Entropie des Textes.
+    Unterstützt Zeichen-Ebene ('char') oder Wort-Ebene ('word' / Tokens).
     """
     if not text:
-        return 0
-    
-    probabilities = [n_x / len(text) for x, n_x in Counter(text).items()]
+        return 0.0
+        
+    if level == 'word':
+        elements = word_tokenize(text.lower())
+    else:
+        elements = list(text)
+        
+    probabilities = [count / len(elements) for element, count in Counter(elements).items()]
     entropy = -sum(p * math.log2(p) for p in probabilities)
     return round(entropy, 4)
 
 def apply_semantic_perturbation(text, perturbation_rate=0.2):
     """
-    Wendet semantische Perturbation an (Synonym-Tausch), um fragile 
-    steganographische Signale zu zerstören (Data Perturbation aus Abschnitt 6.1).
+    Wendet semantisch erhaltende Perturbation an, um steganographische Kanäle zu stören.
+    Nutzt POS-Tagging für grammatikalisch korrekte Synonym-Ersetzungen.
     """
-    words = text.split()
+    tokens = word_tokenize(text)
+    tagged_tokens = pos_tag(tokens)
     perturbed_words = []
     
-    for word in words:
-        # Mit einer bestimmten Wahrscheinlichkeit (perturbation_rate) ein Synonym suchen
-        if random.random() < perturbation_rate and word.isalpha():
-            synonyms = wordnet.synsets(word)
-            if synonyms:
-                # Nimm das erste Lemma (Synonym) des ersten Synsets, das nicht das Ursprungswort ist
-                lemmas = synonyms[0].lemma_names()
-                valid_lemmas = [lemma for lemma in lemmas if lemma.lower() != word.lower()]
-                if valid_lemmas:
-                    # Ersetze Unterstriche durch Leerzeichen (WordNet-Formatierung)
-                    chosen_synonym = random.choice(valid_lemmas).replace('_', ' ')
-                    perturbed_words.append(chosen_synonym)
-                    continue
-        
-        # Wenn kein Synonym gefunden wurde oder die Wahrscheinlichkeit nicht griff
+    for word, tag in tagged_tokens:
+        # Nur alphabetische Wörter stören, Rate prüfen
+        if word.isalpha() and random.random() < perturbation_rate:
+            wn_tag = get_wordnet_pos(tag)
+            if wn_tag:
+                # Suche nach Synonymen mit exakt derselben Wortart
+                synsets = wordnet.synsets(word, pos=wn_tag)
+                if synsets:
+                    lemmas = []
+                    for synset in synsets:
+                        for lemma in synset.lemma_names():
+                            if lemma.lower() != word.lower() and '_' not in lemma:
+                                lemmas.append(lemma)
+                    
+                    if lemmas:
+                        # Behalte die Groß-/Kleinschreibung des Originals bei
+                        chosen = random.choice(lemmas)
+                        if word.istitle():
+                            chosen = chosen.capitalize()
+                        perturbed_words.append(chosen)
+                        continue
+                        
         perturbed_words.append(word)
         
-    return " ".join(perturbed_words)
+    # Setze den Text wieder zusammen (simpel)
+    # Für produktiven Einsatz würde man hier Detokenization nutzen (z.B. MosesDetokenizer)
+    return " ".join(perturbed_words).replace(" ,", ",").replace(" .", ".").replace(" !", "!")
 
-if __name__ == "__main__":
-    print("=== AI Slop Steganography Defense Toolkit ===")
+def main():
+    parser = argparse.ArgumentParser(description="AI Slop Steganography Defense Toolkit")
+    parser.add_argument("--text", type=str, help="Der zu analysierende Text. Wenn leer, wird ein Beispiel verwendet.")
+    parser.add_argument("--rate", type=float, default=0.25, help="Wahrscheinlichkeit für Synonym-Ersetzung (0.0 bis 1.0).")
+    args = parser.parse_args()
+
+    print("=== 🛡️ AI Slop Steganography Defense Toolkit ===\n")
     
-    # Simulierter AI Slop Text (könnte eine versteckte Payload enthalten)
-    suspicious_slop = (
+    text = args.text if args.text else (
         "The quick implementation of advanced neural networks completely transforms "
         "digital landscapes. Technology rapidly evolves."
     )
     
-    print("\n[1] Original AI Slop:")
-    print(suspicious_slop)
+    print("[1] Original Text:")
+    print(text)
     
-    # 1. Entropie-Analyse
-    entropy_score = calculate_shannon_entropy(suspicious_slop)
-    print(f"\n[2] Entropy Analysis Score: {entropy_score} bits/char")
-    print("    (Note: Baseline comparisons would flag anomalies here.)")
+    word_entropy = calculate_entropy(text, level='word')
+    char_entropy = calculate_entropy(text, level='char')
+    print(f"\n[2] Entropy Analysis:")
+    print(f"    - Word-Level Entropy: {word_entropy} bits/word")
+    print(f"    - Char-Level Entropy: {char_entropy} bits/char")
     
-    # 2. Data Perturbation anwenden
-    print("\n[3] Applying Semantic Perturbation (breaking covert channels)...")
-    sanitized_text = apply_semantic_perturbation(suspicious_slop, perturbation_rate=0.4)
+    print(f"\n[3] Applying Semantic Perturbation (Rate: {args.rate * 100}%)...")
+    sanitized_text = apply_semantic_perturbation(text, perturbation_rate=args.rate)
     
-    print("\n[4] Sanitized Training Data (Safe for Open-Source ingestion):")
+    print("\n[4] Sanitized Output Data:")
     print(sanitized_text)
-    print("\nConclusion: Fragile steganographic token-distributions have been disrupted.")
+    print("\n[✓] Fragile steganographic channels have been disrupted.")
+
+if __name__ == "__main__":
+    main()
