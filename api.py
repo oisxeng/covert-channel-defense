@@ -10,15 +10,19 @@ app = FastAPI(title="Advanced Synthetic Media Steganalysis API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Für Produktion hier deine Netlify URL eintragen
+    allow_origins=["*"], 
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+def calculate_transition_rate(bit_array):
+    """Berechnet, wie oft benachbarte Bits ihren Zustand wechseln (0->1 oder 1->0)."""
+    if len(bit_array) < 2: return 0.0
+    transitions = np.sum(bit_array[:-1] != bit_array[1:])
+    return transitions / (len(bit_array) - 1)
+
 def extract_smart_payload(lsb_flat, max_bytes=10000):
-    """Liest die Bits aus und sucht mit Regex gezielt nach Mustern."""
     chars = []
-    # Bits zu Text umwandeln (bis max_bytes)
     for i in range(0, min(len(lsb_flat), max_bytes * 8) - 8, 8):
         byte_val = int("".join(map(str, lsb_flat[i:i+8])), 2)
         if 32 <= byte_val <= 126:
@@ -27,21 +31,13 @@ def extract_smart_payload(lsb_flat, max_bytes=10000):
             chars.append('.')
             
     raw_text = "".join(chars)
-    
-    # 1. Filtere zusammenhängende Wörter (min. 5 Zeichen)
     words = re.findall(r'[A-Za-z0-9_]{5,}', raw_text)
-    
-    # 2. Suche nach URLs oder IPs
     urls = re.findall(r'(https?://[^\s]+|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})', raw_text)
-    
-    # 3. Base64 verdächtige Strings (lange Alphanumerische Ketten)
     base64_suspects = re.findall(r'(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?', raw_text)
 
-    snippet = raw_text[:800] + "..." if len(raw_text) > 800 else raw_text
-    
     return {
-        "raw_snippet": snippet,
-        "found_words": words[:10], # Zeige die ersten 10 gefundenen Wörter
+        "raw_snippet": raw_text[:800] + "..." if len(raw_text) > 800 else raw_text,
+        "found_words": words[:10],
         "found_urls": urls,
         "base64_suspects": len(base64_suspects) > 0
     }
@@ -49,57 +45,72 @@ def extract_smart_payload(lsb_flat, max_bytes=10000):
 @app.post("/analyze/image")
 async def analyze_image(file: UploadFile = File(...)):
     try:
-        # 1. Bild einlesen
         image_bytes = await file.read()
-        img = Image.open(io.BytesIO(image_bytes)).convert('L') # Graustufen
+        # INNOVATION 1: Wir behalten die Farbkanäle (RGB), statt sie in Graustufen zu matschen!
+        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
         pixel_data = np.array(img, dtype=np.int16)
         
-        # 2. Bits extrahieren
-        lsb = pixel_data & 1          # Least Significant Bit (Versteck)
-        msb = (pixel_data >> 4) & 15  # Höhere Bits (Bildstruktur)
+        # Aufteilen in Farbkanäle (R, G, B)
+        channel_entropies = []
+        channel_transitions = []
+        lsb_blue_flat = []
         
-        # 3. Layer 1: Global LSB Entropy
-        counts_global = np.bincount(lsb.flatten())
-        prob_global = counts_global / len(lsb.flatten())
-        global_entropy = entropy(prob_global, base=2)
-        
-        # 4. Layer 2: Flat-Region Steganalysis
-        diffs = np.abs(msb[:, :-1] - msb[:, 1:])
-        flat_mask = (diffs == 0) # Finde Bereiche, in denen das Bild optisch völlig glatt ist
-        
-        flat_lsbs = lsb[:, :-1][flat_mask]
-        
-        if len(flat_lsbs) > 1000:
-            counts_flat = np.bincount(flat_lsbs)
-            prob_flat = counts_flat / len(flat_lsbs)
-            flat_entropy = entropy(prob_flat, base=2)
-        else:
-            flat_entropy = global_entropy # Fallback bei extrem verrauschten Bildern
+        for c in range(3):
+            channel_data = pixel_data[:, :, c]
+            lsb = channel_data & 1
+            lsb_flat = lsb.flatten()
+            
+            # Entropie pro Kanal
+            counts = np.bincount(lsb_flat)
+            if len(counts) == 2:
+                prob = counts / len(lsb_flat)
+                ch_entropy = entropy(prob, base=2)
+            else:
+                ch_entropy = 0.0
+                
+            channel_entropies.append(ch_entropy)
+            
+            # INNOVATION 2: Transition Rate (Bit-Flip-Analyse)
+            # Echter Krypto-Code nähert sich perfekt 0.5 an. Sensorrauschen weicht davon ab.
+            ch_trans = calculate_transition_rate(lsb_flat)
+            channel_transitions.append(ch_trans)
+            
+            if c == 2: # Wir merken uns den Blau-Kanal für die Text-Extraktion
+                lsb_blue_flat = lsb_flat
 
-        # 5. Layer 3: Correlation Analysis (Handy-Kamera Filter)
-        # Wenn LSB extrem rauscht (Entropie hoch), aber MSB auch rauscht -> Normale Kamera.
-        # Wenn LSB extrem rauscht, MSB aber glatt ist -> Steganographie!
-        anomaly_score = flat_entropy * (1.0 if len(flat_lsbs) > 1000 else 0.8)
+        # Der höchste Entropie-Wert gewinnt (meistens Blau bei Steganographie)
+        max_entropy = max(channel_entropies)
         
-        is_anomaly = bool(anomaly_score > 0.9997)
+        # Prüfen, wie nah die Transition Rate an perfektem Zufall (0.5) ist
+        # Je näher an 0 (also 0.5 - 0.5 = 0), desto verdächtiger!
+        trans_deviation = abs(0.5 - channel_transitions[2]) # Wir prüfen den Blau-Kanal
         
-        # 6. Smart Payload Extraction
-        extraction_results = extract_smart_payload(lsb.flatten())
+        # INNOVATION 3: Smarte Anomalie-Berechnung
+        # Hohe Entropie + Transition Rate extrem nah an 0.5 = Alarm!
+        is_anomaly = False
+        if max_entropy > 0.9998 and trans_deviation < 0.005:
+            is_anomaly = True
+            
+        anomaly_score = max_entropy # Für das Frontend-Kompatibilität
+
+        # Extrahiere Text bevorzugt aus dem Blau-Kanal
+        extraction_results = extract_smart_payload(lsb_blue_flat)
 
         return {
             "filename": file.filename,
             "metrics": {
-                "global_entropy": round(global_entropy, 6),
-                "flat_region_entropy": round(flat_entropy, 6),
-                "anomaly_score": round(anomaly_score, 6)
+                "global_entropy": round(max_entropy, 6),
+                "flat_region_entropy": round(max_entropy, 6), # Beibehalten für Frontend-Kompatibilität
+                "anomaly_score": round(anomaly_score, 6),
+                "blue_channel_transition_rate": round(channel_transitions[2], 6) # Neues, mächtiges Metrik-Feld
             },
             "anomaly_detected": is_anomaly,
             "extraction": extraction_results,
-            "message": "🚨 SEVERE ANOMALY DETECTED: Covert channel or steganographic payload highly probable." if is_anomaly else "✅ SAFE: Noise profiles match natural sensor characteristics or benign compression."
+            "message": "🚨 SEVERE ANOMALY: Perfect cryptographic randomness detected in color channels (Steganography)." if is_anomaly else "✅ SAFE: Natural variance in bit transitions detected (Sensor Noise)."
         }
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/")
 def read_root():
-    return {"status": "Advanced Steganalysis API is operational.", "version": "2.0"}
+    return {"status": "Advanced Steganalysis API (RGB & Transition-Aware) is operational.", "version": "3.0"}
